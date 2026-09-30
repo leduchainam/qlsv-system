@@ -56,10 +56,52 @@ services:
       - web-app
       - phpmyadmin
 
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node_exporter
+    networks:
+      - monitoring-network
+
+  mysqld-exporter:
+    image: prom/mysqld-exporter:latest
+    container_name: mysqld_exporter
+    environment:
+      DATA_SOURCE_NAME: "${MYSQL_USER}:${MYSQL_PASSWORD}@(db:3306)/"
+    networks:
+      - backend-network
+      - monitoring-network
+    depends_on:
+      - db
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - monitoring-network
+    depends_on:
+      - node-exporter
+      - mysqld-exporter
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+    networks:
+      - monitoring-network
+    depends_on:
+      - prometheus
+
 networks:
   frontend-network:
     driver: bridge
   backend-network:
+    driver: bridge
+  monitoring-network:
     driver: bridge
 
 volumes:
