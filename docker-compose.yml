@@ -66,8 +66,8 @@ services:
   mysqld-exporter:
     image: prom/mysqld-exporter:latest
     container_name: mysqld_exporter
-    environment:
-      DATA_SOURCE_NAME: "${MYSQL_USER}:${MYSQL_PASSWORD}@(db:3306)/"
+    volumes:
+      - ./monitoring/mysqld-exporter/.my.cnf:/.my.cnf:ro
     networks:
       - backend-network
       - monitoring-network
@@ -77,6 +77,8 @@ services:
   prometheus:
     image: prom/prometheus:latest
     container_name: prometheus
+    ports:
+      - "9090:9090"
     volumes:
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     networks:
