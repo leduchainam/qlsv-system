@@ -1,9 +1,97 @@
 const express = require('express');
 const mysql = require('mysql2/promise');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const app = express();
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
+
+// Security & Authentication Configuration
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
+const SESSION_SECRET = process.env.SESSION_SECRET || 'qlsv_secure_session_token_key_2026';
+const LOG_FILE_PATH = '/var/log/app/app.log';
+
+// Structured Logger: ghi log có cấu trúc chuẩn JSON ra cả stdout và /var/log/app/app.log
+function writeLog(level, event, data = {}) {
+    const logEntry = {
+        timestamp: new Date().toISOString(),
+        level: level.toUpperCase(),
+        event,
+        ...data
+    };
+    const logString = JSON.stringify(logEntry);
+    console.log(logString);
+    try {
+        fs.appendFileSync(LOG_FILE_PATH, logString + '\n');
+    } catch (e) {
+        // Bỏ qua nếu volume log chưa sẵn sàng
+    }
+}
+
+// Token xác thực chống giả mạo bằng HMAC-SHA256 (Hiệu lực 24 giờ)
+function createAuthToken(username) {
+    const timestamp = Date.now();
+    const payload = `${username}:${timestamp}`;
+    const signature = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('hex');
+    return `${payload}:${signature}`;
+}
+
+function verifyAuthToken(token) {
+    if (!token || typeof token !== 'string') return null;
+    const parts = token.split(':');
+    if (parts.length !== 3) return null;
+    const [username, timestamp, signature] = parts;
+    const expectedSig = crypto.createHmac('sha256', SESSION_SECRET).update(`${username}:${timestamp}`).digest('hex');
+    if (signature !== expectedSig) return null;
+    if (Date.now() - parseInt(timestamp, 10) > 24 * 60 * 60 * 1000) return null;
+    return { username };
+}
+
+function getCookie(req, name) {
+    const cookieHeader = req.headers.cookie;
+    if (!cookieHeader) return null;
+    const match = cookieHeader.match(new RegExp('(?:^|;\\s*)' + name + '=([^;]*)'));
+    return match ? decodeURIComponent(match[1]) : null;
+}
+
+function getAuthenticatedUser(req) {
+    const token = getCookie(req, 'qlsv_session') || 
+                  (req.headers.authorization && req.headers.authorization.replace(/^Bearer\s+/i, ''));
+    return verifyAuthToken(token);
+}
+
+function getClientIp(req) {
+    return req.headers['x-forwarded-for']?.split(',')[0]?.trim() || 
+           req.headers['x-real-ip'] || 
+           req.socket.remoteAddress || 
+           '127.0.0.1';
+}
+
+// Middleware bảo vệ các thao tác ghi dữ liệu (RBAC)
+function requireAdminAuth(req, res, next) {
+    const user = getAuthenticatedUser(req);
+    const clientIp = getClientIp(req);
+    if (!user) {
+        writeLog('WARN', 'UNAUTHORIZED_ACCESS_BLOCKED', {
+            path: req.path,
+            method: req.method,
+            ip: clientIp,
+            message: 'Truy cập trái phép bị từ chối (403 Forbidden): Yêu cầu đăng nhập Quản trị viên'
+        });
+        if (req.xhr || req.headers.accept?.includes('json')) {
+            return res.status(403).json({
+                success: false,
+                error: 'Từ chối truy cập (403 Forbidden): Bạn cần đăng nhập tài khoản Quản trị viên để thực hiện thao tác này!'
+            });
+        }
+        return res.status(403).redirect('/?status=unauthorized');
+    }
+    req.user = user;
+    next();
+}
 
 const dbConfig = {
     host: process.env.DB_HOST || 'db',
@@ -34,10 +122,10 @@ async function initDB() {
                 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
             `);
             connection.release();
-            console.log("Database initialized successfully with utf8mb4");
+            writeLog('INFO', 'DATABASE_INITIALIZED', { message: 'Database initialized successfully with utf8mb4' });
             break;
         } catch (err) {
-            console.log(`Waiting for database... retries left: ${retries - 1} (${err.message})`);
+            writeLog('WARN', 'DATABASE_WAITING', { retriesLeft: retries - 1, error: err.message });
             retries--;
             await new Promise(resolve => setTimeout(resolve, 3000));
         }
@@ -45,6 +133,7 @@ async function initDB() {
 }
 
 initDB().catch(console.error);
+
 
 // Helper function to classify score
 function getGrade(score) {
@@ -93,6 +182,9 @@ app.get('/', async (req, res) => {
                 </html>
             `);
         }
+
+        const currentUser = getAuthenticatedUser(req);
+        const isAdmin = !!currentUser;
 
         const [rows] = await pool.query('SELECT * FROM students ORDER BY id DESC');
 
@@ -1034,9 +1126,216 @@ app.get('/', async (req, res) => {
             th, td { border: 1px solid #ccc !important; color: #000 !important; }
         }
 
+        /* Role badges & Auth buttons */
+        .user-role-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            padding: 6px 13px;
+            border-radius: 9999px;
+            font-size: 13px;
+            font-weight: 600;
+            user-select: none;
+        }
+
+        .user-role-badge.guest {
+            background: rgba(148, 163, 184, 0.12);
+            color: var(--text-muted);
+            border: 1px solid rgba(148, 163, 184, 0.25);
+        }
+
+        .user-role-badge.admin {
+            background: rgba(16, 185, 129, 0.15);
+            color: var(--success);
+            border: 1px solid rgba(16, 185, 129, 0.35);
+        }
+
+        .role-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+        }
+
+        .role-dot.guest {
+            background: #94a3b8;
+        }
+
+        .role-dot.admin {
+            background: #10b981;
+            box-shadow: 0 0 10px #10b981;
+            animation: pulse-dot 2s infinite;
+        }
+
+        @keyframes pulse-dot {
+            0%, 100% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.25); opacity: 0.7; }
+        }
+
+        .btn-auth {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 7px 14px;
+            border-radius: 10px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            border: 1px solid transparent;
+            transition: all 0.2s ease;
+        }
+
+        .btn-auth.login {
+            background: var(--primary-gradient);
+            color: #ffffff;
+            box-shadow: 0 4px 14px var(--primary-glow);
+        }
+
+        .btn-auth.login:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 20px var(--primary-glow);
+        }
+
+        .btn-auth.logout {
+            background: var(--bg-surface);
+            color: var(--danger);
+            border-color: rgba(239, 68, 68, 0.3);
+        }
+
+        .btn-auth.logout:hover {
+            background: var(--danger-bg);
+            border-color: var(--danger);
+        }
+
+        .btn-icon.guest-lock {
+            color: var(--text-light);
+            opacity: 0.75;
+        }
+
+        .btn-icon.guest-lock:hover {
+            color: var(--warning);
+            border-color: var(--warning);
+            background: var(--warning-bg);
+            opacity: 1;
+        }
+
+        .demo-account-box {
+            background: rgba(99, 102, 241, 0.08);
+            border: 1px dashed rgba(99, 102, 241, 0.35);
+            border-radius: 12px;
+            padding: 12px 14px;
+            margin-bottom: 18px;
+            font-size: 13px;
+        }
+
+        .demo-account-title {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            color: var(--primary);
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+
+        .demo-account-content {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 12px;
+            color: var(--text-muted);
+        }
+
+        .demo-account-content code {
+            background: var(--bg-surface);
+            color: var(--text-main);
+            padding: 2px 7px;
+            border-radius: 6px;
+            font-family: monospace;
+            font-weight: bold;
+            border: 1px solid var(--border-color);
+        }
+
+        .btn-fill-demo {
+            margin-left: auto;
+            background: var(--primary);
+            color: #fff;
+            border: none;
+            padding: 4px 10px;
+            border-radius: 6px;
+            font-size: 11px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .btn-fill-demo:hover {
+            background: var(--primary-hover);
+        }
+
+        .logql-card {
+            background: var(--bg-surface);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 14px 16px;
+            margin-bottom: 14px;
+            transition: border-color 0.2s ease;
+        }
+
+        .logql-card:hover {
+            border-color: var(--primary);
+        }
+
+        .logql-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 8px;
+        }
+
+        .logql-title {
+            font-weight: 600;
+            font-size: 13px;
+            color: var(--text-main);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .logql-code {
+            background: var(--bg-body);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 10px 14px;
+            font-family: monospace;
+            font-size: 13px;
+            color: #38bdf8;
+            word-break: break-all;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+        }
+
+        .copy-btn-mini {
+            background: rgba(255, 255, 255, 0.08);
+            border: 1px solid var(--border-color);
+            color: var(--text-muted);
+            padding: 4px 8px;
+            border-radius: 6px;
+            font-size: 11px;
+            cursor: pointer;
+            white-space: nowrap;
+            transition: all 0.2s;
+        }
+
+        .copy-btn-mini:hover {
+            background: var(--primary);
+            color: #fff;
+            border-color: var(--primary);
+        }
+
         @media (max-width: 768px) {
             .nav-container { flex-direction: column; align-items: stretch; gap: 12px; }
-            .nav-actions { justify-content: space-between; }
+            .nav-actions { justify-content: space-between; flex-wrap: wrap; }
             .toolbar { flex-direction: column; align-items: stretch; }
             .search-filter-group { flex-direction: column; align-items: stretch; }
             .action-btn-group { justify-content: space-between; }
@@ -1082,8 +1381,43 @@ app.get('/', async (req, res) => {
                         <line x1="12" y1="20" x2="12" y2="4"></line>
                         <line x1="6" y1="20" x2="6" y2="14"></line>
                     </svg>
-                    Grafana (3001)
+                    Grafana
                 </a>
+
+                <button id="openSecurityGuideBtn" type="button" class="btn-nav-link" title="Xem Hướng dẫn An ninh & Mẫu truy vấn LogQL">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+                    </svg>
+                    An ninh & LogQL
+                </button>
+
+                ${currentUser ? `
+                <div class="user-role-badge admin" title="Tài khoản Quản trị viên (Toàn quyền)">
+                    <span class="role-dot admin"></span>
+                    <span>Admin: <strong>${escapeHtml(currentUser.username)}</strong></span>
+                </div>
+                <button id="logoutBtn" type="button" class="btn-auth logout" title="Đăng xuất khỏi hệ thống">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path>
+                        <polyline points="16 17 21 12 16 7"></polyline>
+                        <line x1="21" y1="12" x2="9" y2="12"></line>
+                    </svg>
+                    Đăng xuất
+                </button>
+                ` : `
+                <div class="user-role-badge guest" title="Chế độ khách (Chỉ xem)">
+                    <span class="role-dot guest"></span>
+                    <span>Khách (Chỉ xem)</span>
+                </div>
+                <button id="openLoginModalBtn" type="button" class="btn-auth login" title="Đăng nhập Quản trị viên">
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                        <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+                    </svg>
+                    Đăng nhập Admin
+                </button>
+                `}
+
 
                 <button id="themeToggleBtn" class="theme-toggle" title="Đổi giao diện Sáng / Tối">
                     <svg id="themeIconDark" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1244,11 +1578,9 @@ app.get('/', async (req, res) => {
                 </button>
 
                 ${totalStudents === 0 ? `
-                <form action="/seed" method="POST" style="display:inline;">
-                    <button type="submit" class="btn btn-secondary" style="border-color: var(--primary); color: var(--primary);" title="Thêm 5 bản ghi mẫu">
-                        ⚡ Thêm dữ liệu mẫu
-                    </button>
-                </form>
+                <button type="button" id="seedDataBtn" class="btn btn-secondary" style="border-color: var(--primary); color: var(--primary);" title="Thêm 5 bản ghi mẫu">
+                    ⚡ Thêm dữ liệu mẫu
+                </button>
                 ` : ''}
             </div>
         </section>
@@ -1490,12 +1822,162 @@ app.get('/', async (req, res) => {
         </div>
     </div>
 
+    <!-- Modal: Đăng nhập Quản trị viên (Admin Login) -->
+    <div id="loginModal" class="modal-overlay">
+        <div class="modal-card">
+            <div class="modal-header">
+                <h3>
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                        <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+                    </svg>
+                    Đăng Nhập Quản Trị Viên (Admin)
+                </h3>
+                <button type="button" class="btn-close-modal" onclick="closeLoginModal()">&times;</button>
+            </div>
+            <form id="loginForm" onsubmit="handleLoginSubmit(event)">
+                <div class="modal-body">
+                    <div id="loginAlertBox" style="display: none; padding: 10px 14px; border-radius: 10px; margin-bottom: 16px; font-size: 13px; line-height: 1.5;"></div>
+
+                    <div class="demo-account-box">
+                        <div class="demo-account-title">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>
+                            Tài khoản kiểm thử mặc định:
+                        </div>
+                        <div class="demo-account-content">
+                            <span>User: <code>admin</code></span>
+                            <span>Pass: <code>admin123</code></span>
+                            <button type="button" class="btn-fill-demo" onclick="fillDemoCredentials()">Điền nhanh</button>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="login_username">Tên đăng nhập *</label>
+                        <div class="input-group-custom">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+                                <circle cx="12" cy="7" r="4"></circle>
+                            </svg>
+                            <input type="text" id="login_username" name="username" class="input-control" placeholder="Nhập tên tài khoản..." required autocomplete="username">
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="login_password">Mật khẩu *</label>
+                        <div class="input-group-custom">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                                <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+                            </svg>
+                            <input type="password" id="login_password" name="password" class="input-control" placeholder="Nhập mật khẩu..." required autocomplete="current-password">
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" onclick="closeLoginModal()">Hủy</button>
+                    <button type="submit" id="loginSubmitBtn" class="btn btn-primary">
+                        🔑 Xác Thực Đăng Nhập
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Modal: Hướng dẫn An ninh & Truy vấn LogQL -->
+    <div id="securityGuideModal" class="modal-overlay">
+        <div class="modal-card" style="max-width: 650px;">
+            <div class="modal-header">
+                <h3 style="color: var(--primary);">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+                    </svg>
+                    Bảo Mật Hệ Thống & Kiểm Chứng LogQL
+                </h3>
+                <button type="button" class="btn-close-modal" onclick="closeSecurityGuideModal()">&times;</button>
+            </div>
+            <div class="modal-body" style="max-height: 65vh; overflow-y: auto; padding-right: 10px;">
+                <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 16px; line-height: 1.6;">
+                    Hệ thống tích hợp giám sát log tập trung với <strong>Loki + Promtail</strong>. Mọi sự kiện xác thực, tấn công brute-force hoặc truy cập trái phép đều được ghi nhận thời gian thực để tra cứu trên <strong>Grafana Explore</strong>.
+                </p>
+
+                <div class="logql-card">
+                    <div class="logql-header">
+                        <div class="logql-title">
+                            <span style="color: var(--danger);">🔴 1. Phát hiện Đăng nhập thất bại (HTTP 401)</span>
+                        </div>
+                        <button type="button" class="copy-btn-mini" onclick="copyLogQL('{job=\"nginx\"} |= \"POST /api/login\" |= \" 401 \"')">Sao chép</button>
+                    </div>
+                    <div class="logql-code">
+                        <span>{job="nginx"} |= "POST /api/login" |= " 401 "</span>
+                    </div>
+                </div>
+
+                <div class="logql-card">
+                    <div class="logql-header">
+                        <div class="logql-title">
+                            <span style="color: var(--warning);">⚡ 2. Cảnh báo Tấn công Brute-Force (Tần suất đăng nhập sai)</span>
+                        </div>
+                        <button type="button" class="copy-btn-mini" onclick="copyLogQL('rate({job=\"nginx\"} |= \"POST /api/login\" |= \" 401 \"[1m])')">Sao chép</button>
+                    </div>
+                    <div class="logql-code">
+                        <span>rate({job="nginx"} |= "POST /api/login" |= " 401 "[1m])</span>
+                    </div>
+                </div>
+
+                <div class="logql-card">
+                    <div class="logql-header">
+                        <div class="logql-title">
+                            <span style="color: var(--danger);">🛑 3. Phát hiện Truy cập trái phép bị chặn (HTTP 403 Forbidden)</span>
+                        </div>
+                        <button type="button" class="copy-btn-mini" onclick="copyLogQL('{job=\"nginx\"} |= \" 403 \"')">Sao chép</button>
+                    </div>
+                    <div class="logql-code">
+                        <span>{job="nginx"} |= " 403 "</span>
+                    </div>
+                </div>
+
+                <div class="logql-card">
+                    <div class="logql-header">
+                        <div class="logql-title">
+                            <span style="color: var(--info);">📋 4. Xem Audit Log thao tác từ Web App</span>
+                        </div>
+                        <button type="button" class="copy-btn-mini" onclick="copyLogQL('{job=\"webapp\"} |~ \"(AUTH_|STUDENT_|UNAUTHORIZED)\"')">Sao chép</button>
+                    </div>
+                    <div class="logql-code">
+                        <span>{job="webapp"} |~ "(AUTH_|STUDENT_|UNAUTHORIZED)"</span>
+                    </div>
+                </div>
+
+                <div class="logql-card">
+                    <div class="logql-header">
+                        <div class="logql-title">
+                            <span style="color: var(--success);">🟢 5. Toàn bộ nhật ký truy cập Nginx</span>
+                        </div>
+                        <button type="button" class="copy-btn-mini" onclick="copyLogQL('{job=\"nginx\"}')">Sao chép</button>
+                    </div>
+                    <div class="logql-code">
+                        <span>{job="nginx"}</span>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="closeSecurityGuideModal()">Đóng</button>
+                <a href="http://localhost:3001/explore" target="_blank" class="btn btn-primary" style="text-decoration: none;">
+                    Mở Grafana Explore ↗
+                </a>
+            </div>
+        </div>
+    </div>
+
     <!-- Toast Notification Container -->
     <div id="toastContainer" class="toast-container"></div>
+
 
     <script>
         // Initial Dataset passed from Server
         const rawStudents = ${clientDataJson};
+        const IS_ADMIN = ${isAdmin};
+        const CURRENT_USER = ${JSON.stringify(currentUser ? currentUser.username : null)};
 
         // Colorful avatar background generator based on name
         const avatarColors = [
@@ -1614,12 +2096,21 @@ app.get('/', async (req, res) => {
                     '<td><span class="grade-tag ' + grade.class + '">' + grade.icon + ' ' + grade.label + '</span></td>' +
                     '<td style="text-align: right;">' +
                         '<div class="action-icons" style="justify-content: flex-end;">' +
-                            '<button class="btn-icon edit" onclick="openEditModal(' + s.id + ')" title="Chỉnh sửa thông tin">' +
-                                '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"></path><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path></svg>' +
-                            '</button>' +
-                            '<button class="btn-icon delete" onclick="openDeleteModal(' + s.id + ', \\'' + escapeJs(s.full_name) + '\\', \\'' + escapeJs(s.student_code) + '\\')" title="Xóa sinh viên">' +
-                                '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>' +
-                            '</button>' +
+                            (IS_ADMIN ? (
+                                '<button class="btn-icon edit" onclick="openEditModal(' + s.id + ')" title="Chỉnh sửa thông tin">' +
+                                    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"></path><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path></svg>' +
+                                '</button>' +
+                                '<button class="btn-icon delete" onclick="openDeleteModal(' + s.id + ', \\'' + escapeJs(s.full_name) + '\\', \\'' + escapeJs(s.student_code) + '\\')" title="Xóa sinh viên">' +
+                                    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>' +
+                                '</button>'
+                            ) : (
+                                '<button class="btn-icon guest-lock" onclick="promptAdminLogin(\\'Cần quyền Quản trị viên để chỉnh sửa sinh viên!\\')" title="Yêu cầu đăng nhập Quản trị">' +
+                                    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>' +
+                                '</button>' +
+                                '<button class="btn-icon guest-lock" onclick="promptAdminLogin(\\'Cần quyền Quản trị viên để xóa sinh viên!\\')" title="Yêu cầu đăng nhập Quản trị">' +
+                                    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>' +
+                                '</button>'
+                            )) +
                         '</div>' +
                     '</td>' +
                 '</tr>';
@@ -1646,6 +2137,10 @@ app.get('/', async (req, res) => {
 
         // Modals Management
         function openAddModal() {
+            if (!IS_ADMIN) {
+                promptAdminLogin('Vui lòng đăng nhập Quản trị viên để thêm sinh viên mới!');
+                return;
+            }
             document.getElementById('addModal').classList.add('active');
             document.getElementById('add_student_code').focus();
         }
@@ -1655,6 +2150,10 @@ app.get('/', async (req, res) => {
         }
 
         function openEditModal(id) {
+            if (!IS_ADMIN) {
+                promptAdminLogin('Chỉ Quản trị viên mới có quyền chỉnh sửa hồ sơ sinh viên!');
+                return;
+            }
             const student = rawStudents.find(s => s.id === id);
             if (!student) return;
             document.getElementById('edit_student_code').value = student.student_code;
@@ -1671,6 +2170,10 @@ app.get('/', async (req, res) => {
         }
 
         function openDeleteModal(id, name, code) {
+            if (!IS_ADMIN) {
+                promptAdminLogin('Chỉ Quản trị viên mới có quyền xóa sinh viên khỏi hệ thống!');
+                return;
+            }
             document.getElementById('deleteStudentName').innerText = name;
             document.getElementById('deleteStudentCode').innerText = code;
             document.getElementById('deleteForm').action = '/delete/' + id;
@@ -1680,6 +2183,115 @@ app.get('/', async (req, res) => {
         function closeDeleteModal() {
             document.getElementById('deleteModal').classList.remove('active');
         }
+
+        // Auth & Security Modal Handlers
+        function openLoginModal() {
+            const modal = document.getElementById('loginModal');
+            if (modal) {
+                modal.classList.add('active');
+                document.getElementById('login_username').focus();
+            }
+        }
+
+        function closeLoginModal() {
+            const modal = document.getElementById('loginModal');
+            if (modal) modal.classList.remove('active');
+        }
+
+        function fillDemoCredentials() {
+            document.getElementById('login_username').value = 'admin';
+            document.getElementById('login_password').value = 'admin123';
+            document.getElementById('loginSubmitBtn').focus();
+        }
+
+        function promptAdminLogin(message = 'Vui lòng đăng nhập tài khoản Quản trị viên để thực hiện thao tác này!') {
+            showToast(message, 'danger');
+            const alertBox = document.getElementById('loginAlertBox');
+            if (alertBox) {
+                alertBox.style.display = 'block';
+                alertBox.style.background = 'var(--danger-bg)';
+                alertBox.style.color = 'var(--danger)';
+                alertBox.style.border = '1px solid rgba(239, 68, 68, 0.3)';
+                alertBox.innerText = message;
+            }
+            openLoginModal();
+        }
+
+        async function handleLoginSubmit(e) {
+            e.preventDefault();
+            const usernameInput = document.getElementById('login_username');
+            const passwordInput = document.getElementById('login_password');
+            const submitBtn = document.getElementById('loginSubmitBtn');
+            const alertBox = document.getElementById('loginAlertBox');
+
+            const username = usernameInput.value.trim();
+            const password = passwordInput.value;
+
+            submitBtn.disabled = true;
+            submitBtn.innerText = 'Đang xác thực...';
+            alertBox.style.display = 'none';
+
+            try {
+                const response = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password })
+                });
+
+                const data = await response.json();
+                if (response.ok && data.success) {
+                    showToast('Đăng nhập Quản trị viên thành công!', 'success');
+                    closeLoginModal();
+                    setTimeout(() => {
+                        window.location.href = '/?status=logged_in';
+                    }, 400);
+                } else {
+                    alertBox.style.display = 'block';
+                    alertBox.style.background = 'var(--danger-bg)';
+                    alertBox.style.color = 'var(--danger)';
+                    alertBox.style.border = '1px solid rgba(239, 68, 68, 0.3)';
+                    alertBox.innerText = data.error || 'Tài khoản hoặc mật khẩu không chính xác!';
+                    submitBtn.disabled = false;
+                    submitBtn.innerText = '🔑 Xác Thực Đăng Nhập';
+                }
+            } catch (err) {
+                alertBox.style.display = 'block';
+                alertBox.style.background = 'var(--danger-bg)';
+                alertBox.style.color = 'var(--danger)';
+                alertBox.style.border = '1px solid rgba(239, 68, 68, 0.3)';
+                alertBox.innerText = 'Lỗi kết nối máy chủ: ' + err.message;
+                submitBtn.disabled = false;
+                submitBtn.innerText = '🔑 Xác Thực Đăng Nhập';
+            }
+        }
+
+        async function handleLogout() {
+            try {
+                await fetch('/api/logout', { method: 'POST' });
+                window.location.href = '/?status=logged_out';
+            } catch (e) {
+                window.location.href = '/logout';
+            }
+        }
+
+        function openSecurityGuideModal() {
+            const modal = document.getElementById('securityGuideModal');
+            if (modal) modal.classList.add('active');
+        }
+
+        function closeSecurityGuideModal() {
+            const modal = document.getElementById('securityGuideModal');
+            if (modal) modal.classList.remove('active');
+        }
+
+        function copyLogQL(queryText) {
+            navigator.clipboard.writeText(queryText).then(() => {
+                showToast('Đã sao chép câu lệnh LogQL vào bộ nhớ tạm!', 'success');
+            }).catch(() => {
+                showToast('LogQL: ' + queryText, 'info');
+            });
+        }
+
 
         // Close modal on click outside
         window.addEventListener('click', (e) => {
@@ -1767,8 +2379,33 @@ app.get('/', async (req, res) => {
             setTheme(current === 'light' ? 'dark' : 'light');
         });
 
-        // Add Modal Trigger
-        document.getElementById('openAddModalBtn').addEventListener('click', openAddModal);
+        // Event Listeners for Buttons
+        const addBtn = document.getElementById('openAddModalBtn');
+        if (addBtn) addBtn.addEventListener('click', openAddModal);
+
+        const openLoginBtn = document.getElementById('openLoginModalBtn');
+        if (openLoginBtn) openLoginBtn.addEventListener('click', openLoginModal);
+
+        const logoutBtn = document.getElementById('logoutBtn');
+        if (logoutBtn) logoutBtn.addEventListener('click', handleLogout);
+
+        const securityGuideBtn = document.getElementById('openSecurityGuideBtn');
+        if (securityGuideBtn) securityGuideBtn.addEventListener('click', openSecurityGuideModal);
+
+        const seedBtn = document.getElementById('seedDataBtn');
+        if (seedBtn) {
+            seedBtn.addEventListener('click', () => {
+                if (!IS_ADMIN) {
+                    promptAdminLogin('Vui lòng đăng nhập Quản trị viên để nạp 5 sinh viên mẫu!');
+                    return;
+                }
+                const form = document.createElement('form');
+                form.method = 'POST';
+                form.action = '/seed';
+                document.body.appendChild(form);
+                form.submit();
+            });
+        }
 
         // Filter & Search Events
         document.getElementById('searchInput').addEventListener('input', renderStudents);
@@ -1791,6 +2428,15 @@ app.get('/', async (req, res) => {
         } else if (status === 'seeded') {
             showToast('Đã tạo 5 hồ sơ sinh viên mẫu thành công!', 'success');
             window.history.replaceState({}, document.title, window.location.pathname);
+        } else if (status === 'logged_in') {
+            showToast('Đăng nhập Quản trị viên thành công!', 'success');
+            window.history.replaceState({}, document.title, window.location.pathname);
+        } else if (status === 'logged_out') {
+            showToast('Đã đăng xuất khỏi hệ thống!', 'info');
+            window.history.replaceState({}, document.title, window.location.pathname);
+        } else if (status === 'unauthorized') {
+            showToast('Từ chối truy cập (403): Yêu cầu quyền Quản trị viên!', 'danger');
+            window.history.replaceState({}, document.title, window.location.pathname);
         }
 
         // Initial render
@@ -1801,13 +2447,64 @@ app.get('/', async (req, res) => {
 
         res.send(html);
     } catch (e) {
-        console.error("Dashboard error:", e);
+        writeLog('ERROR', 'DASHBOARD_ERROR', { error: e.message });
         res.status(500).send("Lỗi kết nối CSDL: " + e.message);
     }
 });
 
-// Route: Thêm sinh viên mới
-app.post('/add', async (req, res) => {
+// Route: Đăng nhập quản trị viên
+app.post('/api/login', (req, res) => {
+    const clientIp = getClientIp(req);
+    const { username, password } = req.body || {};
+
+    if (username === ADMIN_USERNAME && password === ADMIN_PASSWORD) {
+        const token = createAuthToken(username);
+        res.setHeader('Set-Cookie', `qlsv_session=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400`);
+        writeLog('INFO', 'AUTH_SUCCESS', {
+            user: username,
+            ip: clientIp,
+            message: 'Admin authenticated successfully'
+        });
+        return res.json({ success: true, message: 'Đăng nhập thành công!', user: username, token });
+    } else {
+        writeLog('WARN', 'AUTH_FAILED', {
+            user: username || 'anonymous',
+            ip: clientIp,
+            message: 'Failed login attempt with incorrect credentials'
+        });
+        return res.status(401).json({ success: false, error: 'Tên đăng nhập hoặc mật khẩu không chính xác!' });
+    }
+});
+
+// Route: Đăng xuất
+app.all(['/api/logout', '/logout'], (req, res) => {
+    const clientIp = getClientIp(req);
+    const user = getAuthenticatedUser(req);
+    res.setHeader('Set-Cookie', 'qlsv_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
+    writeLog('INFO', 'AUTH_LOGOUT', {
+        user: user?.username || 'unknown',
+        ip: clientIp,
+        message: 'Admin logged out'
+    });
+    if (req.method === 'GET') {
+        return res.redirect('/?status=logged_out');
+    }
+    return res.json({ success: true, message: 'Đã đăng xuất thành công!' });
+});
+
+// Route: Kiểm tra trạng thái đăng nhập
+app.get('/api/auth-status', (req, res) => {
+    const user = getAuthenticatedUser(req);
+    res.json({
+        authenticated: !!user,
+        user: user ? user.username : null,
+        role: user ? 'admin' : 'guest'
+    });
+});
+
+// Route: Thêm sinh viên mới (Yêu cầu quyền Admin)
+app.post('/add', requireAdminAuth, async (req, res) => {
+    const clientIp = getClientIp(req);
     try {
         const { student_code, full_name, class_name, score } = req.body;
         if (!student_code || !full_name || !class_name || score === undefined) {
@@ -1817,14 +2514,24 @@ app.post('/add', async (req, res) => {
             'INSERT INTO students (student_code, full_name, class_name, score) VALUES (?, ?, ?, ?)', 
             [student_code.trim(), full_name.trim(), class_name.trim(), parseFloat(score)]
         );
+        writeLog('INFO', 'STUDENT_ADDED', {
+            student_code: student_code.trim(),
+            full_name: full_name.trim(),
+            class_name: class_name.trim(),
+            score: parseFloat(score),
+            user: req.user.username,
+            ip: clientIp
+        });
         res.redirect('/?status=added');
     } catch (e) {
+        writeLog('ERROR', 'STUDENT_ADD_FAILED', { error: e.message, ip: clientIp });
         res.status(500).send("Lỗi thêm sinh viên: " + e.message);
     }
 });
 
-// Route: Cập nhật thông tin sinh viên
-app.post('/edit/:id', async (req, res) => {
+// Route: Cập nhật thông tin sinh viên (Yêu cầu quyền Admin)
+app.post('/edit/:id', requireAdminAuth, async (req, res) => {
+    const clientIp = getClientIp(req);
     try {
         const { student_code, full_name, class_name, score } = req.body;
         const id = req.params.id;
@@ -1832,24 +2539,43 @@ app.post('/edit/:id', async (req, res) => {
             'UPDATE students SET student_code = ?, full_name = ?, class_name = ?, score = ? WHERE id = ?',
             [student_code.trim(), full_name.trim(), class_name.trim(), parseFloat(score), id]
         );
+        writeLog('INFO', 'STUDENT_UPDATED', {
+            student_id: id,
+            student_code: student_code.trim(),
+            full_name: full_name.trim(),
+            class_name: class_name.trim(),
+            score: parseFloat(score),
+            user: req.user.username,
+            ip: clientIp
+        });
         res.redirect('/?status=updated');
     } catch (e) {
+        writeLog('ERROR', 'STUDENT_UPDATE_FAILED', { student_id: req.params.id, error: e.message, ip: clientIp });
         res.status(500).send("Lỗi cập nhật sinh viên: " + e.message);
     }
 });
 
-// Route: Xóa sinh viên
-app.post('/delete/:id', async (req, res) => {
+// Route: Xóa sinh viên (Yêu cầu quyền Admin)
+app.post('/delete/:id', requireAdminAuth, async (req, res) => {
+    const clientIp = getClientIp(req);
     try {
-        await pool.query('DELETE FROM students WHERE id = ?', [req.params.id]);
+        const id = req.params.id;
+        await pool.query('DELETE FROM students WHERE id = ?', [id]);
+        writeLog('INFO', 'STUDENT_DELETED', {
+            student_id: id,
+            user: req.user.username,
+            ip: clientIp
+        });
         res.redirect('/?status=deleted');
     } catch (e) {
+        writeLog('ERROR', 'STUDENT_DELETE_FAILED', { student_id: req.params.id, error: e.message, ip: clientIp });
         res.status(500).send("Lỗi xóa sinh viên: " + e.message);
     }
 });
 
-// Route: Tạo dữ liệu mẫu (Sample data seeder)
-app.post('/seed', async (req, res) => {
+// Route: Tạo dữ liệu mẫu (Yêu cầu quyền Admin)
+app.post('/seed', requireAdminAuth, async (req, res) => {
+    const clientIp = getClientIp(req);
     try {
         const sampleStudents = [
             ['B21DCCN001', 'Nguyễn Văn An', 'D21CQCN01', 8.8],
@@ -1865,8 +2591,14 @@ app.post('/seed', async (req, res) => {
                 s
             );
         }
+        writeLog('INFO', 'SAMPLE_DATA_SEEDED', {
+            count: sampleStudents.length,
+            user: req.user.username,
+            ip: clientIp
+        });
         res.redirect('/?status=seeded');
     } catch (e) {
+        writeLog('ERROR', 'SAMPLE_DATA_SEED_FAILED', { error: e.message, ip: clientIp });
         res.status(500).send("Lỗi tạo dữ liệu mẫu: " + e.message);
     }
 });
@@ -1884,8 +2616,14 @@ app.get('/api/students', async (req, res) => {
 
 // Route: Health check
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok', uptime: process.uptime() });
+    res.json({
+        status: 'ok',
+        uptime: process.uptime(),
+        auth_enabled: true,
+        timestamp: new Date().toISOString()
+    });
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Server running on port ${port}`));
+app.listen(port, () => writeLog('INFO', 'SERVER_STARTED', { port, message: `Server running on port ${port}` }));
+

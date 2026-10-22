@@ -9,3 +9,4 @@ cert/
 BAO_CAO_*.md
 report_extracted.txt
 generate_docx_report.py
+*.png

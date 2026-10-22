@@ -8,7 +8,7 @@
 
 | Dịch Vụ | Giao Thức / URL Truy Cập | Cổng (Port) | Tài Khoản / Mật Khẩu Mặc Định | Mô Tả |
 | :--- | :--- | :--- | :--- | :--- |
-| **Web Application** | [https://localhost](https://localhost) *(hoặc `https://<IP_MÁY_ẢO>`)* | `443` (HTTPS) | Không yêu cầu | Giao diện quản lý hồ sơ sinh viên (CRUD) |
+| **Web Application** | [https://localhost](https://localhost) *(hoặc `https://<IP_MÁY_ẢO>`)* | `443` (HTTPS) | Khách: Chỉ xem<br>Admin: `admin` / `admin123` | Giao diện quản lý sinh viên với phân quyền RBAC |
 | **HTTP Redirect** | [http://localhost](http://localhost) | `80` (HTTP) | - | Tự động chuyển hướng (301) sang HTTPS 443 |
 | **phpMyAdmin** | [https://localhost/phpmyadmin/](https://localhost/phpmyadmin/) | `443` | User: `student_user` hoặc `root`<br>Pass: Trong tệp `.env` | Giao diện quản trị cơ sở dữ liệu MySQL |
 | **Grafana Dashboard** | [http://localhost:3001](http://localhost:3001) *(hoặc `http://<IP>:3001`)* | `3001` | User: `admin`<br>Pass: `admin` *(hoặc giá trị `GRAFANA_PASSWORD`)* | Trực quan hóa hiệu năng máy chủ và MySQL |
@@ -25,7 +25,7 @@
 Hệ thống được thiết kế theo mô hình Microservices đa tầng với 3 mạng ảo (Docker Networks) độc lập:
 
 * **Tầng Gateway:** Nginx làm Reverse Proxy, tiếp nhận cổng 80 & 443, SSL/TLS Termination, cấu hình Security Headers (CSP, X-Frame-Options, nosniff).
-* **Tầng Ứng Dụng (Application):** Node.js 18 (Alpine), Express REST API, đóng gói an toàn chạy dưới quyền **Non-root user (`appuser`)**.
+* **Tầng Ứng Dụng (Application):** Node.js 18 (Alpine), Express REST API, đóng gói an toàn chạy dưới quyền **Non-root user (`appuser`)**, tích hợp xác thực Quản trị viên (RBAC) và ghi Audit Log.
 * **Tầng Dữ Liệu (Database):** MySQL 8.0 lưu trữ bền vững với Docker Volume `db_data`, cô lập hoàn toàn trong mạng nội bộ `backend-network` (đóng cổng 3306 ra ngoài máy host).
 * **Tầng Giám Sát (Metrics):**
   * `node-exporter`: Thu thập chỉ số tài nguyên máy chủ host (CPU, RAM, Disk, Network).
@@ -33,7 +33,7 @@ Hệ thống được thiết kế theo mô hình Microservices đa tầng với
   * `prometheus`: Cào dữ liệu định kỳ mỗi 15 giây.
   * `grafana`: Tự động nạp sẵn (Provisioning) Datasource và Dashboards.
 * **Tầng Quản Lý Nhật Ký (Logging):**
-  * `promtail`: Đọc liên tục tệp log Nginx từ volume chia sẻ `nginx_logs`.
+  * `promtail`: Đọc liên tục tệp log Nginx (`nginx_logs`) và ứng dụng Web (`app_logs`).
   * `loki`: Lưu trữ và lập chỉ mục metadata log, hỗ trợ truy vấn bằng **LogQL**.
 
 ---
@@ -59,6 +59,8 @@ MYSQL_PASSWORD=student_secure_password
 PORT=3000
 NODE_ENV=production
 GRAFANA_PASSWORD=admin
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=admin123
 ```
 
 ### 3. Khởi chạy toàn bộ hệ thống
@@ -82,28 +84,35 @@ Truy cập Grafana tại `http://localhost:3001` -> Menu **Explore** -> Chọn D
    ```logql
    {job="nginx"}
    ```
-2. **Lọc các yêu cầu thành công HTTP 200:**
+2. **Lọc phát hiện đăng nhập thất bại (HTTP 401 Unauthorized):**
    ```logql
-   {job="nginx"} |= " 200 "
+   {job="nginx"} |= "POST /api/login" |= " 401 "
    ```
-3. **Lọc các yêu cầu lỗi HTTP 4xx hoặc 5xx:**
+3. **Cảnh báo tấn công dò mật khẩu (Brute-Force Rate):**
    ```logql
-   {job="nginx"} |~ "HTTP/1.1\" [45]"
+   rate({job="nginx"} |= "POST /api/login" |= " 401 "[1m])
    ```
-4. **Vẽ biểu đồ tần suất request trên mỗi phút:**
+4. **Phát hiện truy cập trái phép bị chặn (HTTP 403 Forbidden):**
    ```logql
-   rate({job="nginx"}[1m])
+   {job="nginx"} |= " 403 "
+   ```
+5. **Xem Audit Log thao tác từ Web App:**
+   ```logql
+   {job="webapp"} |~ "(AUTH_|STUDENT_|UNAUTHORIZED)"
    ```
 
 ---
 
 ## 🛡️ Các Biện Pháp Gia Cố Bảo Mật (Hardening)
 
+* ✅ **Kiểm Soát Quyền Truy Cập (RBAC):** Phân định rạch ròi 2 vai trò: **Khách (Guest)** chỉ được tra cứu/xem điểm và **Quản trị viên (Admin)** mới có quyền can thiệp CSDL (Thêm/Sửa/Xóa/Seed).
+* ✅ **Ghi Nhật Ký Truy Vết (Audit Trail):** Mọi hành động nhạy cảm hoặc đăng nhập sai đều được ghi log có cấu trúc để phục vụ điều tra sự cố an ninh.
 * ✅ **Non-root Container:** Ứng dụng Web chạy với tài khoản `appuser` (UID=100), hạn chế tối đa nguy cơ leo thang đặc quyền.
 * ✅ **Network Segmentation:** Tách biệt 3 mạng `frontend-network`, `backend-network`, `monitoring-network`. Không phơi lộ cổng Database 3306 ra ngoài Host.
 * ✅ **Mã Hóa HTTPS:** Nginx tích hợp chứng chỉ SSL/TLS 2048-bit, tự động chuyển hướng HTTP sang HTTPS.
 * ✅ **HTTP Security Headers:** Thiết lập `X-Frame-Options: SAMEORIGIN`, `X-Content-Type-Options: nosniff`, `Referrer-Policy`, và `Content-Security-Policy`.
 * ✅ **Bảo Mật Cấu Hình:** Tệp mật khẩu `.env` được loại trừ khỏi Git (`.gitignore`) và phân quyền an toàn `chmod 600`.
+
 
 ---
 

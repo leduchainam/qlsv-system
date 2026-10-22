@@ -37,6 +37,10 @@ services:
       MYSQL_DATABASE: ${MYSQL_DATABASE}
       PORT: ${PORT}
       NODE_ENV: ${NODE_ENV}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin123}
+    volumes:
+      - app_logs:/var/log/app
     networks:
       - frontend-network
       - backend-network
@@ -119,6 +123,7 @@ services:
     container_name: promtail
     volumes:
       - nginx_logs:/var/log/nginx:ro
+      - app_logs:/var/log/app:ro
       - ./monitoring/promtail/promtail-config.yml:/mnt/config/promtail-config.yml:ro
     command: -config.file=/mnt/config/promtail-config.yml
     networks:
@@ -138,3 +143,4 @@ networks:
 volumes:
   db_data:
   nginx_logs:
+  app_logs:
