@@ -3,3 +3,9 @@ node_modules/
 cert/
 *.key
 *.crt
+
+# Báo cáo và file tạm
+*.docx
+BAO_CAO_*.md
+report_extracted.txt
+generate_docx_report.py
