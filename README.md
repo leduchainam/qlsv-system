@@ -76,6 +76,39 @@ docker compose ps
 
 ---
 
+## 📊 Hướng Dẫn Truy Vấn PromQL Mẫu (Prometheus Server)
+
+Truy cập Prometheus tại `http://localhost:9090` -> Thẻ **Graph** -> Nhập biểu thức vào ô **Expression** và nhấn **Execute**:
+
+1. **Kiểm tra trạng thái UP/DOWN của toàn bộ Exporter:**
+   ```promql
+   up
+   ```
+2. **Tỷ lệ CPU máy chủ đang sử dụng (%):**
+   ```promql
+   100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[1m])) * 100)
+   ```
+3. **Tỷ lệ bộ nhớ RAM đang sử dụng (%):**
+   ```promql
+   ((node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes) * 100
+   ```
+4. **Kiểm tra kết nối MySQL sống/chết (1 = UP, 0 = DOWN):**
+   ```promql
+   mysql_up
+   ```
+5. **Số lượng kết nối đang mở đến MySQL:**
+   ```promql
+   mysql_global_status_threads_connected
+   ```
+6. **Tần suất truy vấn MySQL mỗi giây (QPS):**
+   ```promql
+   rate(mysql_global_status_questions[1m])
+   ```
+
+👉 *Xem hướng dẫn tra cứu đầy đủ tại:* **[PROMQL_QUERIES.md](file:///home/ubuntu/qlsv-system/PROMQL_QUERIES.md)**
+
+---
+
 ## 🔍 Hướng Dẫn Truy Vấn LogQL Mẫu (Grafana Explore)
 
 Truy cập Grafana tại `http://localhost:3001` -> Menu **Explore** -> Chọn Datasource **Loki**:
@@ -100,6 +133,8 @@ Truy cập Grafana tại `http://localhost:3001` -> Menu **Explore** -> Chọn D
    ```logql
    {job="webapp"} |~ "(AUTH_|STUDENT_|UNAUTHORIZED)"
    ```
+
+👉 *Xem hướng dẫn tra cứu đầy đủ tại:* **[LOGQL_QUERIES.md](file:///home/ubuntu/qlsv-system/LOGQL_QUERIES.md)**
 
 ---
 
